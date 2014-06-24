@@ -445,6 +445,8 @@ public class PackageManagerService extends IPackageManager.Stub {
     final ActivityIntentResolver mReceivers =
             new ActivityIntentResolver();
 
+    final HashSet<String> mAllowances = new HashSet<String>();
+
     // All available services, for your resolving pleasure.
     final ServiceIntentResolver mServices = new ServiceIntentResolver();
 
@@ -1575,8 +1577,30 @@ public class PackageManagerService extends IPackageManager.Stub {
                 mSettings.readDefaultPreferredAppsLPw(this, 0);
             }
 
+            // Disable components marked for disabling at build-time
+            for (String name : mContext.getResources().getStringArray(
+                    com.android.internal.R.array.config_disabledComponents)) {
+                ComponentName cn = ComponentName.unflattenFromString(name);
+                Slog.v(TAG, "Disabling " + name);
+                String className = cn.getClassName();
+                PackageSetting pkgSetting = mSettings.mPackages.get(cn.getPackageName());
+                if (pkgSetting == null || pkgSetting.pkg == null
+                        || !pkgSetting.pkg.hasComponentClassName(className)) {
+                    Slog.w(TAG, "Unable to disable " + name);
+                    continue;
+                }
+                pkgSetting.disableComponentLPw(className, UserHandle.USER_OWNER);
+            }
+
             // can downgrade to reader
             mSettings.writeLPr();
+
+            if (SELinuxMMAC.shouldRestorecon()) {
+                Slog.i(TAG, "Relabeling of /data/data and /data/user issued.");
+                if (mInstaller.restoreconData()) {
+                    SELinuxMMAC.setRestoreconDone();
+                }
+            }
 
             EventLog.writeEvent(EventLogTags.BOOT_PROGRESS_PMS_READY,
                     SystemClock.uptimeMillis());
@@ -1780,6 +1804,26 @@ public class PackageManagerService extends IPackageManager.Stub {
                     perms.add(perm);
                     XmlUtils.skipCurrentTag(parser);
 
+                } else if ("allow-permission".equals(name)) {
+                    String perm = parser.getAttributeValue(null, "name");
+                    if (perm == null) {
+                        Slog.w(TAG,
+                                "<allow-permission> without name at "
+                                        + parser.getPositionDescription());
+                        XmlUtils.skipCurrentTag(parser);
+                        continue;
+                    }
+                    String sharedUserId = parser.getAttributeValue(null, "sharedUserId");
+                    if (sharedUserId == null) {
+                        Slog.w(TAG,
+                                "<allow-permission> without uid at "
+                                        + parser.getPositionDescription());
+                        XmlUtils.skipCurrentTag(parser);
+                        continue;
+                    }
+                    mAllowances.add(sharedUserId + ":" + perm);
+                    XmlUtils.skipCurrentTag(parser);
+
                 } else if ("library".equals(name)) {
                     String lname = parser.getAttributeValue(null, "name");
                     String lfile = parser.getAttributeValue(null, "file");
@@ -1968,8 +2012,7 @@ public class PackageManagerService extends IPackageManager.Stub {
             if((ps == null) || (ps.pkg == null) || (ps.pkg.applicationInfo == null)) {
                 return -1;
             }
-            p = ps.pkg;
-            return p != null ? UserHandle.getUid(userId, p.applicationInfo.uid) : -1;
+            return UserHandle.getUid(userId, ps.pkg.applicationInfo.uid);
         }
     }
 
@@ -3751,6 +3794,7 @@ public class PackageManagerService extends IPackageManager.Stub {
             updatedPkg = mSettings.getDisabledSystemPkgLPr(ps != null ? ps.name : pkg.packageName);
             if (DEBUG_INSTALL && updatedPkg != null) Slog.d(TAG, "updatedPkg = " + updatedPkg);
         }
+        boolean updatedPkgBetter = false;
         // First check if this is a system package that may involve an update
         if (updatedPkg != null && (parseFlags&PackageParser.PARSE_IS_SYSTEM) != 0) {
             if (ps != null && !ps.codePath.equals(scanFile)) {
@@ -3805,6 +3849,7 @@ public class PackageManagerService extends IPackageManager.Stub {
                     synchronized (mPackages) {
                         mSettings.enableSystemPackageLPw(ps.name);
                     }
+                    updatedPkgBetter = true;
                 }
             }
         }
@@ -3881,7 +3926,7 @@ public class PackageManagerService extends IPackageManager.Stub {
 
         String codePath = null;
         String resPath = null;
-        if ((parseFlags & PackageParser.PARSE_FORWARD_LOCK) != 0) {
+        if ((parseFlags & PackageParser.PARSE_FORWARD_LOCK) != 0 && !updatedPkgBetter) {
             if (ps != null && ps.resourcePathString != null) {
                 resPath = ps.resourcePathString;
             } else {
@@ -4168,7 +4213,7 @@ public class PackageManagerService extends IPackageManager.Stub {
         for (int user : users) {
             if (user != 0) {
                 res = mInstaller.createUserData(packageName,
-                        UserHandle.getUid(user, uid), user);
+                        UserHandle.getUid(user, uid), user, seinfo);
                 if (res < 0) {
                     return res;
                 }
@@ -4777,7 +4822,10 @@ public class PackageManagerService extends IPackageManager.Stub {
                          * Update native library dir if it starts with
                          * /data/data
                          */
-                        if (nativeLibraryDir.getPath().startsWith(dataPathString)) {
+                        // For devices using /datadata, dataPathString will point
+                        // to /datadata while nativeLibraryDir will point to /data/data.
+                        // Thus, compare to /data/data directly to avoid problems.
+                        if (nativeLibraryDir.getPath().startsWith("/data/data")) {
                             setInternalAppNativeLibraryPath(pkg, pkgSetting);
                             nativeLibraryDir = new File(pkg.applicationInfo.nativeLibraryDir);
                         }
@@ -6278,7 +6326,9 @@ public class PackageManagerService extends IPackageManager.Stub {
                 bp.packageSetting.signatures.mSignatures, pkg.mSignatures)
                         == PackageManager.SIGNATURE_MATCH)
                 || (compareSignatures(mPlatformPackage.mSignatures, pkg.mSignatures)
-                        == PackageManager.SIGNATURE_MATCH);
+                        == PackageManager.SIGNATURE_MATCH)
+                || (pkg.mSharedUserId != null
+                        && mAllowances.contains(pkg.mSharedUserId + ":" + perm));
         if (!allowed && (bp.protectionLevel
                 & PermissionInfo.PROTECTION_FLAG_SYSTEM) != 0) {
             if (isSystemApp(pkg)) {
@@ -6340,8 +6390,20 @@ public class PackageManagerService extends IPackageManager.Stub {
                 int userId) {
             if (!sUserManager.exists(userId)) return null;
             mFlags = flags;
-            return super.queryIntent(intent, resolvedType,
+            List<ResolveInfo> list = super.queryIntent(intent, resolvedType,
                     (flags & PackageManager.MATCH_DEFAULT_ONLY) != 0, userId);
+
+            // Remove protected Application components
+            if (Binder.getCallingUid() != Process.SYSTEM_UID) {
+                Iterator<ResolveInfo> itr = list.iterator();
+                while (itr.hasNext()) {
+                    if (itr.next().activityInfo.applicationInfo.protect) {
+                        itr.remove();
+                    }
+                }
+            }
+
+            return list;
         }
 
         public List<ResolveInfo> queryIntentForPackage(Intent intent, String resolvedType,
@@ -10293,7 +10355,7 @@ public class PackageManagerService extends IPackageManager.Stub {
                         true,  //stopped
                         true,  //notLaunched
                         false, //blocked
-                        null, null, null);
+                        null, null, null, null, null);
                 if (!isSystemApp(ps)) {
                     if (ps.isAnyInstalled(sUserManager.getUserIds())) {
                         // Other user still have this package installed, so all
@@ -12384,5 +12446,68 @@ public class PackageManagerService extends IPackageManager.Stub {
     @Override
     public ComposedIconInfo getComposedIconInfo() {
         return mIconPackHelper != null ? mIconPackHelper.getComposedIconInfo() : null;
+    }
+
+    @Override
+    public void setComponentProtectedSetting(ComponentName componentName, boolean newState,
+            int userId) {
+        enforceCrossUserPermission(Binder.getCallingUid(), userId, false, "set protected");
+
+        String packageName = componentName.getPackageName();
+        String className = componentName.getClassName();
+
+        PackageSetting pkgSetting;
+        ArrayList<String> components;
+
+        synchronized (mPackages) {
+            pkgSetting = mSettings.mPackages.get(packageName);
+
+            if (pkgSetting == null) {
+                if (className == null) {
+                    throw new IllegalArgumentException(
+                            "Unknown package: " + packageName);
+                }
+                throw new IllegalArgumentException(
+                        "Unknown component: " + packageName
+                                + "/" + className);
+            }
+
+            //Protection levels must be applied at the Component Level!
+            if (className == null) {
+                throw new IllegalArgumentException(
+                        "Must specify Component Class name."
+                );
+            } else {
+                PackageParser.Package pkg = pkgSetting.pkg;
+                if (pkg == null || !pkg.hasComponentClassName(className)) {
+                    if (pkg.applicationInfo.targetSdkVersion >= Build.VERSION_CODES.JELLY_BEAN) {
+                        throw new IllegalArgumentException("Component class " + className
+                                + " does not exist in " + packageName);
+                    } else {
+                        Slog.w(TAG, "Failed setComponentProtectedSetting: component class "
+                                + className + " does not exist in " + packageName);
+                    }
+                }
+
+                pkgSetting.protectComponentLPw(className, newState, userId);
+                mSettings.writePackageRestrictionsLPr(userId);
+
+                components = mPendingBroadcasts.get(userId, packageName);
+                final boolean newPackage = components == null;
+                if (newPackage) {
+                    components = new ArrayList<String>();
+                }
+                if (!components.contains(className)) {
+                    components.add(className);
+                }
+            }
+        }
+
+        long callingId = Binder.clearCallingIdentity();
+        try {
+            int packageUid = UserHandle.getUid(userId, pkgSetting.appId);
+        } finally {
+            Binder.restoreCallingIdentity(callingId);
+        }
     }
 }
