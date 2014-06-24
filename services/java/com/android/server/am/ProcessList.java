@@ -122,7 +122,7 @@ final class ProcessList {
     static final int MAX_CACHED_APPS = 24;
 
     // We allow empty processes to stick around for at most 15 minutes.
-    static final long MAX_EMPTY_TIME = 30*60*1000;
+    static final long MAX_EMPTY_TIME = 15*60*1000;
 
     // The maximum number of empty app processes we will let sit around.
     private static final int MAX_EMPTY_APPS = computeEmptyProcessLimit(MAX_CACHED_APPS);
